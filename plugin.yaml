@@ -1,9 +1,9 @@
 name: dreamer
-version: 1.1.0
+version: 1.2.0
 description: "When Hermes goes idle, it dreams: replays the day's session residue, generates a narrative dream with actionable insights, and whispers them into the next session."
 author: AION
 license: MIT
-homepage: https://github.com/aion-project/dreamer
+homepage: https://github.com/Cosmonautic1/hermes-dreamer
 tags: [memory, sleep, reflection, consolidation]
 provides_tools:
   - dream_now
@@ -15,5 +15,6 @@ config_schema:
   enabled: {type: bool, default: true, description: "Master switch: allow Hermes to dream while idle"}
   interval_minutes: {type: int, default: 720, description: "Minimum minutes between dreams"}
   idle_minutes: {type: int, default: 15, description: "Hermes must be idle this long before a dream may start"}
-  max_tokens: {type: int, default: 900, description: "Max tokens for the dream generation LLM call"}
+  deep_sleep_minutes: {type: int, default: 60, description: "Idle this long = a deep dream (wider view, longer narrative). Below = a light dream"}
+  max_tokens: {type: int, default: 900, description: "Max tokens for the dream generation LLM call (deep dreams use at least 1200)"}
   inject_max_chars: {type: int, default: 2000, description: "Max chars of dream residue injected into a fresh session"}

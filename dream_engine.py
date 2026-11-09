@@ -59,7 +59,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     # Additive migration for journals created by v1.0.0 (no mood/symbols yet)
     existing = {r[1] for r in conn.execute("PRAGMA table_info(dreams)")}
-    for col, ddl in (("mood", "TEXT"), ("symbols_json", "TEXT")):
+    for col, ddl in (("mood", "TEXT"), ("symbols_json", "TEXT"), ("dream_type", "TEXT")):
         if col not in existing:
             conn.execute(f"ALTER TABLE dreams ADD COLUMN {col} {ddl}")
     conn.execute(
@@ -340,9 +340,14 @@ def _llm_text_block(text: str) -> Any:
 
 def generate_dream(ctx: Any, residue: Dict[str, Any], topics_hint: str = "",
                    max_tokens: int = 900,
-                   continuity: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+                   continuity: Optional[Dict[str, Any]] = None,
+                   arc: Optional[list] = None,
+                   phase: str = "light") -> Optional[Dict[str, Any]]:
     """Phase 2: the LLM call. Returns {'title','narrative','insights',...} or None."""
     residue_text = _residue_text(residue, topics_hint)
+    if arc:
+        residue_text += "\nDream arc (the shape sleep has been drawing lately):\n"
+        residue_text += "\n".join(f"- {line}" for line in arc)
     if continuity:
         residue_text += (
             "\nContinuity (sleep is cumulative - do not repeat the last dream, "
@@ -351,37 +356,74 @@ def generate_dream(ctx: Any, residue: Dict[str, Any], topics_hint: str = "",
             f"{(continuity.get('narrative') or '')[:350]}\n"
             "Previous insights so far: " + "; ".join(continuity.get("insights", [])[:3])
         )
-    try:
-        result = ctx.llm.complete_structured(
-            instructions=DREAM_INSTRUCTIONS,
-            input=[_llm_text_block(residue_text)],
-            system_prompt=DREAM_SYSTEM_PROMPT,
-            json_mode=True,
-            schema_name="Dream",
-            max_tokens=max_tokens,
-            timeout=240,
-            purpose="dreamer dream cycle",
+    if phase == "deep":
+        residue_text += (
+            "\nThis is a DEEP dream: a long idle period. Take the wider view - the "
+            "arc, not just the day. Length: 150-250 words."
         )
-        parsed = getattr(result, "parsed", None)
-        if isinstance(parsed, dict) and parsed.get("narrative"):
-            data = parsed
-        else:
-            data = _extract_json(getattr(result, "text", "") or "")
-    except Exception as e:  # noqa: BLE001 - honest skip, never fabricate a dream
-        logger.warning("dreamer: LLM call failed: %s", e)
-        return None
+    def _call_llm(complaint: str) -> Optional[Dict[str, Any]]:
+        text = residue_text + (f"\n\nQuality complaint to fix in the retry: {complaint}"
+                               if complaint else "")
+        try:
+            result = ctx.llm.complete_structured(
+                instructions=DREAM_INSTRUCTIONS,
+                input=[_llm_text_block(text)],
+                system_prompt=DREAM_SYSTEM_PROMPT,
+                json_mode=True,
+                schema_name="Dream",
+                max_tokens=max_tokens,
+                timeout=240,
+                purpose="dreamer dream cycle",
+            )
+            parsed = getattr(result, "parsed", None)
+            if isinstance(parsed, dict) and parsed.get("narrative"):
+                return parsed
+            return _extract_json(getattr(result, "text", "") or "")
+        except Exception as e:  # noqa: BLE001 - honest skip, never fabricate a dream
+            logger.warning("dreamer: LLM call failed: %s", e)
+            return None
+
+    data = _call_llm("")
     if not data or not isinstance(data.get("narrative"), str) or not data["narrative"].strip():
         logger.warning("dreamer: dream generation returned no narrative")
         return None
+    # Quality gate v1.2: substantive narrative + at least one insight; one retry.
+    _min_chars = 350 if phase == "deep" else 250
+    data_norm = _normalize_dream(data)
+    if (len(data_norm["narrative"]) < _min_chars or not data_norm["insights"]
+            or not data_norm["mood"]):
+        complaint = []
+        if len(data_norm["narrative"]) < _min_chars:
+            complaint.append(f"narrative too thin ({len(data_norm['narrative'])} chars, "
+                             f"need {_min_chars})")
+        if not data_norm["insights"]:
+            complaint.append("no insights returned")
+        if not data_norm["mood"]:
+            complaint.append("no mood returned")
+        retry = _call_llm("; ".join(complaint))
+        retry_norm = _normalize_dream(retry) if retry else None
+        if retry_norm and len(retry_norm["narrative"]) >= _min_chars and retry_norm["insights"]:
+            data_norm = retry_norm
+            logger.info("dreamer: quality retry accepted the improved dream")
+        elif retry_norm:
+            data_norm = {**data_norm, "insights": data_norm["insights"] or retry_norm["insights"],
+                         "mood": data_norm["mood"] or retry_norm["mood"]}
+    return data_norm
+
+_DREAM_BANNED_PREFIXES = ("i dreamed", "i dream", "last night", "in my dream",
+                          "you dreamed", "last night i", "the dream")
+
+
+def _normalize_dream(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a parsed LLM dict onto the dream shape: strip, ban stock openings,
+    clamp fields. Never raises - a malformed field degrades to empty."""
     insights = data.get("insights") or []
     if isinstance(insights, str):
         insights = [insights]
     if not isinstance(insights, list):
         insights = []
-    _BANNED_PREFIXES = ("i dreamed", "i dream", "last night", "in my dream",
-                        "you dreamed", "last night i", "the dream")
-    narrative = data["narrative"].strip()[:4000]
-    for prefix in _BANNED_PREFIXES:
+    narrative = str(data.get("narrative") or "").strip()[:4000]
+    for prefix in _DREAM_BANNED_PREFIXES:
         if narrative.lower().startswith(prefix):
             narrative = narrative[len(prefix):].lstrip(" ,.;:-'\"")
             break
@@ -453,17 +495,34 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
                 followup = _insight_followup_check(
                     profile, insights_prev, since_ts=last_dream_ts)
                 residue["insight_followup"] = followup
+            # Dream arc (v1.2): the last 3 dreams as one-line trend context.
+            arc_rows = conn.execute(
+                "SELECT title, narrative FROM dreams ORDER BY id DESC LIMIT 3"
+            ).fetchall() if prev_row else []
+            arc = [f"'{t}': {(n or '')[:110].strip()}..."
+                   for t, n in arc_rows if t]
+
+            # Sleep phase (v1.2): light vs deep, decided by idle length.
+            deep_after = max(0, int(ctx.get_config("deep_sleep_minutes", default=60)))
+            idle_minutes = float(idle_state.get("idle_minutes") or 0)
+            phase = "deep" if idle_minutes >= deep_after else "light"
+            phase_tokens = max(600, int(ctx.get_config("max_tokens", default=900)))
+            if phase == "deep":
+                phase_tokens = max(phase_tokens, 1200)
+
             dream = generate_dream(ctx, residue, topics_hint,
-                                   max_tokens=max_tokens, continuity=continuity)
+                                   max_tokens=phase_tokens, continuity=continuity,
+                                   arc=arc, phase=phase)
             if dream is None:
                 return {"error": "Dream generation failed (LLM unavailable). No dream was recorded."}
+            dream["dream_type"] = phase
             window_end = now
             window_start = last_dream_ts if last_dream_ts else now - 86400
             conn.execute(
                 "INSERT INTO dreams (ts, created_at, window_start, window_end, "
                 "session_count, message_count, tool_calls, title, narrative, "
-                "insights_json, residue_chars, generated_by, mood, symbols_json) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "insights_json, residue_chars, generated_by, mood, symbols_json, dream_type) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     now,
                     datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
@@ -476,6 +535,7 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
                     str(getattr(getattr(ctx, "llm", None), "__class__", "?") or "active-model"),
                     dream.get("mood") or None,
                     json.dumps(dream.get("symbols") or []),
+                    dream["dream_type"],
                 ),
             )
             conn.execute(
@@ -561,7 +621,7 @@ def list_dreams(limit: int = 5) -> List[Dict[str, Any]]:
     try:
         rows = conn.execute(
             "SELECT id, created_at, title, narrative, insights_json, injected, "
-            "inject_count, mood, symbols_json "
+            "inject_count, mood, symbols_json, dream_type "
             "FROM dreams ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         for row in rows:
             try:
@@ -577,6 +637,7 @@ def list_dreams(limit: int = 5) -> List[Dict[str, Any]]:
                 "narrative": row[3], "insights": insights,
                 "delivered_to_session": bool(row[5]), "injections": row[6],
                 "mood": row[7], "symbols": symbols,
+                "dream_type": row[9] or "light",
             })
     finally:
         conn.close()

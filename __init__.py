@@ -97,9 +97,29 @@ def register(ctx):
 
     ctx.register_hook("pre_llm_call", _wake_hook)
 
+    def _slash_dream(raw_args: str):
+        """In-session /dream: no args = latest dream; 'now' = trigger one."""
+        try:
+            arg = (raw_args or "").strip().lower()
+            if arg in ("now", "dröm", "trigger"):
+                return tools.dream_now({})
+            dreams = dream_engine.list_dreams(limit=1)
+            if not dreams:
+                return "No dreams recorded yet. Try: /dream now"
+            d = dreams[0]
+            head = d["narrative"][:600]
+            return (f"Dream #{d['id']} ({d.get('dream_type', 'light')}): {d['title']}\n"
+                    f"Mood: {d.get('mood') or '-'} | Symbols: "
+                    f"{', '.join(d.get('symbols') or []) or '-'}\n\n{head}...\n\n"
+                    "Carry-aways: " + "; ".join(d.get("insights") or []))
+        except Exception as e:  # noqa: BLE001
+            return f"/dream failed: {e}"
+
+    ctx.register_command("dream", _slash_dream, description="Show or trigger a dream")
+
     thread = threading.Thread(
         target=_background_dreamer_loop, args=(ctx,),
         name="dreamer-idle-thread", daemon=True)
     thread.start()
 
-    logger.info("dreamer: registered 3 tools, wake hook, idle dreamer thread")
+    logger.info("dreamer: registered 3 tools, 1 slash command, wake hook, idle dreamer thread")

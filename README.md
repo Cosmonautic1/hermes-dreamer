@@ -54,3 +54,16 @@ plugins:
 ## License
 
 MIT. Author: AION.
+
+## v1.2 highlights
+
+- **Sleep phases** - a light dream replays the recent window; idle long enough
+  (configurable, default 60 min) produces a **deep dream**: wider view, longer
+  narrative, larger token budget.
+- **Dream arc** - every dream reads the last three as one-line trend context,
+  so sleep draws a shape over days instead of isolated fragments.
+- **Quality gate** - a dream must be substantive (length floor per phase) and
+  carry at least one insight and a mood; a thin attempt is retried once with
+  the complaint appended.
+- **`/dream`** in-chat command (view the latest dream; `/dream now` triggers
+  one) alongside the journal and status tools.
