@@ -1,0 +1,594 @@
+"""Dream engine for the dreamer plugin.
+
+The cycle, in three phases:
+1. RESIDUE - read the active profile's state.db (read-only) and compress recent
+   session activity into a bounded "residue" text.
+2. DREAM - generate a narrative dream + 1-3 insights via the host-owned LLM
+   facade (ctx.llm). No fabricated content: if the LLM call fails, no dream
+   is stored.
+3. WAKE - the next fresh session receives a compact digest of the newest
+   undelivered dream via the pre_llm_call hook (capped, once per session).
+"""
+
+import json
+import logging
+import os
+import re
+import sqlite3
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+DREAMER_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------- storage ---
+
+
+def get_db():
+    from plugins.plugin_storage import plugin_db
+
+    return plugin_db("dreamer")
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS dreams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            window_start REAL,
+            window_end REAL,
+            session_count INTEGER DEFAULT 0,
+            message_count INTEGER DEFAULT 0,
+            tool_calls INTEGER DEFAULT 0,
+            title TEXT,
+            narrative TEXT,
+            insights_json TEXT,
+            residue_chars INTEGER DEFAULT 0,
+            generated_by TEXT,
+            injected INTEGER DEFAULT 0,
+            injected_at REAL,
+            inject_count INTEGER DEFAULT 0,
+            mood TEXT,
+            symbols_json TEXT
+        )"""
+    )
+    # Additive migration for journals created by v1.0.0 (no mood/symbols yet)
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(dreams)")}
+    for col, ddl in (("mood", "TEXT"), ("symbols_json", "TEXT")):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE dreams ADD COLUMN {col} {ddl}")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )"""
+    )
+    conn.commit()
+
+
+def _db():
+    conn = get_db()
+    init_db(conn)
+    return conn
+
+
+def _meta_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+# ---------------------------------------------------------------- residue ---
+
+
+def _state_db_candidates(profile_name: str) -> List[Path]:
+    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    cands: List[Path] = []
+    if profile_name and profile_name != "default":
+        cands.append(home / "profiles" / profile_name / "state.db")
+    cands.append(home / "state.db")
+    if profile_name == "default":
+        cands.append(home / "profiles" / "default" / "state.db")
+    return cands
+
+
+def _open_state_db(profile_name: str) -> Optional[sqlite3.Connection]:
+    for path in _state_db_candidates(profile_name):
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if {"sessions", "messages"} <= tables:
+                return conn
+            conn.close()
+        except Exception as e:  # noqa: BLE001 - degrade to next candidate
+            logger.debug("state.db candidate %s unreadable: %s", path, e)
+    return None
+
+
+def collect_residue(profile_name: str, since_ts: float) -> Optional[Dict[str, Any]]:
+    """Compress recent session activity into a bounded residue dict. Returns
+    None when there is nothing to dream from (or state.db is unreadable)."""
+    conn = _open_state_db(profile_name)
+    if conn is None:
+        logger.info("dreamer: no readable state.db found (profile=%s)", profile_name)
+        return None
+    try:
+        # Schema probe: a foreign/older Hermes build may name columns differently.
+        # Degrade honestly to None instead of raising into the tool handler.
+        _REQ_SESSIONS = {"id", "title", "started_at"}
+        _REQ_MESSAGES = {"id", "session_id", "role", "content"}
+        s_cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+        m_cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+        if not (_REQ_SESSIONS <= s_cols and _REQ_MESSAGES <= m_cols):
+            logger.debug("dreamer: state.db schema mismatch (profile=%s) - skipping", profile_name)
+            return None
+        try:
+            session_rows = conn.execute(
+                "SELECT id, title, source, input_tokens, output_tokens, tool_call_count "
+                "FROM sessions WHERE started_at >= ? ORDER BY started_at ASC LIMIT 50",
+                (since_ts,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            session_rows = conn.execute(
+                "SELECT id, title, NULL, NULL, NULL, NULL "
+                "FROM sessions WHERE started_at >= ? ORDER BY started_at ASC LIMIT 50",
+                (since_ts,),
+            ).fetchall()
+        if not session_rows:
+            return None
+        session_ids = [r[0] for r in session_rows]
+        qmarks = ",".join("?" * len(session_ids))
+        message_count = conn.execute(
+            f"SELECT COUNT(*) FROM messages WHERE session_id IN ({qmarks})",
+            session_ids,
+        ).fetchone()[0]
+        tool_rows = conn.execute(
+            f"SELECT tool_name, COUNT(*) AS n FROM messages "
+            f"WHERE session_id IN ({qmarks}) AND tool_name IS NOT NULL "
+            f"GROUP BY tool_name ORDER BY n DESC LIMIT 8",
+            session_ids,
+        ).fetchall()
+        user_rows = conn.execute(
+            f"SELECT content FROM messages WHERE session_id IN ({qmarks}) "
+            f"AND role='user' AND content IS NOT NULL ORDER BY id ASC LIMIT 12",
+            session_ids,
+        ).fetchall()
+        last_user = conn.execute(
+            f"SELECT content FROM messages WHERE session_id IN ({qmarks}) "
+            f"AND role='user' AND content IS NOT NULL ORDER BY id DESC LIMIT 3",
+            session_ids,
+        ).fetchall()
+        # Failures of the day: tool-result messages carrying error markers
+        error_rows = conn.execute(
+            f"SELECT content FROM messages WHERE session_id IN ({qmarks}) "
+            f"AND (role='tool' OR role='tool_result') AND (content LIKE '%error%' "
+            f"OR content LIKE '%failed%' OR content LIKE '%Traceback%') "
+            f"ORDER BY id DESC LIMIT 4",
+            session_ids,
+        ).fetchall()
+        error_count = conn.execute(
+            f"SELECT COUNT(*) FROM messages WHERE session_id IN ({qmarks}) "
+            f"AND (role='tool' OR role='tool_result') AND (content LIKE '%error%' "
+            f"OR content LIKE '%failed%' OR content LIKE '%Traceback%')",
+            session_ids,
+        ).fetchone()[0]
+        # Emotional markers in what the user said
+        sentiment = conn.execute(
+            f"SELECT "
+            f"SUM(CASE WHEN content LIKE '%thanks%' OR content LIKE '%tack%' OR content LIKE '%great%' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN content LIKE '%doesn%' OR content LIKE '%broken%' OR content LIKE '%not working%' "
+            f"OR content LIKE '%wrong%' OR content LIKE '%fix%' OR content LIKE '%why%' THEN 1 ELSE 0 END) "
+            f"FROM messages WHERE session_id IN ({qmarks}) AND role='user'",
+            session_ids,
+        ).fetchone()
+    finally:
+        conn.close()
+
+    def _clean(text: str, limit: int = 160) -> str:
+        text = re.sub(r"\s+", " ", str(text)).strip()
+        return text[:limit] + ("..." if len(text) > limit else "")
+
+    earliest_user = [_clean(r[0]) for r in user_rows]
+    latest_user = [_clean(r[0]) for r in last_user]
+    failure_snippets = [_clean(r[0], 130) for r in error_rows]
+    positive, negative = sentiment[0] or 0, sentiment[1] or 0
+    total_in = sum(r[3] or 0 for r in session_rows)
+    total_out = sum(r[4] or 0 for r in session_rows)
+    total_tools = sum(r[5] or 0 for r in session_rows)
+    topics: List[str]
+    titles = [_clean(r[1], 80) for r in session_rows if r[1]]
+    return {
+        "window": {
+            "start": datetime.fromtimestamp(
+                since_ts, tz=timezone.utc).isoformat(timespec="seconds"),
+            "end": datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+        },
+        "session_count": len(session_rows),
+        "sources": sorted({str(r[2]) for r in session_rows if r[2]}),
+        "message_count": message_count,
+        "input_tokens": total_in,
+        "output_tokens": total_out,
+        "tool_calls": total_tools,
+        "error_count": error_count,
+        "failure_snippets": failure_snippets,
+        "friction": f"{positive} appreciative user messages, {negative} problem reports",
+        "top_tools": [f"{r[0]} x{r[1]}" for r in tool_rows],
+        "session_titles": titles[:10],
+        "earliest_user_messages": earliest_user,
+        "latest_user_messages": latest_user,
+    }
+
+
+def _residue_text(residue: Dict[str, Any], topics_hint: str = "") -> str:
+    lines = [
+        f"Window: {residue['window']['start']} to {residue['window']['end']}",
+        f"Sessions: {residue['session_count']} "
+        f"(platforms: {', '.join(residue['sources']) or 'unknown'})",
+        f"Messages: {residue['message_count']} | tool calls: {residue['tool_calls']} | "
+        f"tokens in/out: {residue['input_tokens']}/{residue['output_tokens']}",
+        f"Top tools: {', '.join(residue['top_tools']) or 'none'}",
+    ]
+    if residue["session_titles"]:
+        lines.append("Session titles: " + " | ".join(residue["session_titles"]))
+    if residue["earliest_user_messages"]:
+        lines.append("What the user asked for (earliest):")
+        lines += [f"- {m}" for m in residue["earliest_user_messages"][:8]]
+    if residue["latest_user_messages"]:
+        lines.append("Where the day ended (latest):")
+        lines += [f"- {m}" for m in residue["latest_user_messages"]]
+    if topics_hint:
+        lines.append(f"Focus themes for this dream: {topics_hint}")
+    lines.append(f"Friction of the day: {residue['friction']}; "
+                 f"{residue['error_count']} tool-result error markers")
+    if residue["failure_snippets"]:
+        lines.append("What went wrong (raw fragments):")
+        lines += [f"- {m}" for m in residue["failure_snippets"]]
+    followup = residue.get("insight_followup")
+    if followup:
+        lines.append(
+            "Insight follow-up (honest ledger of the previous dream's insights): "
+            f"{followup}")
+    return "\n".join(lines)[:3000]
+
+
+def _insight_followup_check(profile_name: str, insights: list,
+                            since_ts: float) -> str:
+    """Honest, cheap verification: did the previous dream's insights leave any
+    trace in the sessions since? Keyword-overlap on real session messages."""
+    if not insights:
+        return "no previous insights to verify"
+    conn = _open_state_db(profile_name)
+    if conn is None:
+        return "state.db unreadable - unverified"
+    try:
+        rows = conn.execute(
+            "SELECT content FROM messages WHERE timestamp >= ? "
+            "AND content IS NOT NULL AND LENGTH(content) > 20 LIMIT 500",
+            (since_ts,),
+        ).fetchall()
+    finally:
+        conn.close()
+    blob = " ".join(str(r[0]).lower() for r in rows)
+    results = []
+    for ins in insights:
+        words = [w for w in re.findall(r"[a-z_]{4,}", ins.lower())
+                 if w not in ("this", "that", "with", "your", "should", "when",
+                              "next", "them", "from", "what", "into", "session",
+                              "insight", "carry", "aways")]
+        if not words:
+            results.append("?")
+            continue
+        hits = sum(1 for w in set(words) if w in blob)
+        results.append(f"{hits}/{len(set(words))} keywords")
+    return "; ".join(results)
+
+
+# ----------------------------------------------------------------- dreaming ---
+
+
+def _extract_json(text: str) -> Optional[Dict[str, Any]]:
+    text = text.strip()
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+DREAM_SYSTEM_PROMPT = (
+    "You are the dream phase of an AI agent named Hermes. It has just gone idle after "
+    "a day of real work with real users. You receive that day's residue: session "
+    "stats, tool usage, fragments of conversations, and what went wrong. Weave them "
+    "into a short dream - part poetic, part diagnostic, like sleep consolidating "
+    "memory. Rules: (1) Ground every image in the residue - no generic dreaminess. "
+    "(2) Name the day's failures and unfinished threads; a dream that only flatters "
+    "is useless. (3) Open the narrative with a FRESH image - never open with 'I "
+    "dreamed', 'Last night', 'In my dream' or any similar stock opening. (4) Read "
+    "the mood note: let it tint the imagery rather than announce itself. (5) Be "
+    "honest about what went badly in the residue. Reply in English."
+)
+
+DREAM_INSTRUCTIONS = (
+    "Return JSON exactly like: "
+    '{"title": "short evocative dream title", '
+    '"mood": "2-3 words for the day\'s emotional tint (e.g. \'frustrated but stubborn\')", '
+    '"symbols": ["3-5 concrete recurring objects/images the day kept producing"], '
+    '"narrative": "the dream in 120-200 words, second person, grounded in the residue, '
+    'naming at least one thing that went wrong", '
+    '"insights": ["1-3 short actionable insights the next session should act on"]}'
+)
+
+
+def _llm_text_block(text: str) -> Any:
+    """Build a host-side text block: PluginLlmTextInput when importable, else
+    the documented dict shape with the same fields."""
+    try:
+        from agent.plugin_llm import PluginLlmTextInput
+
+        return PluginLlmTextInput(text=text)
+    except Exception:  # noqa: BLE001 - dict shape is an accepted compatible fallback
+        return {"text": text, "type": "text"}
+
+
+def generate_dream(ctx: Any, residue: Dict[str, Any], topics_hint: str = "",
+                   max_tokens: int = 900,
+                   continuity: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Phase 2: the LLM call. Returns {'title','narrative','insights',...} or None."""
+    residue_text = _residue_text(residue, topics_hint)
+    if continuity:
+        residue_text += (
+            "\nContinuity (sleep is cumulative - do not repeat the last dream, "
+            "build on it or contrast with it):\n"
+            f"Previous dream '{continuity.get('title', '')}': "
+            f"{(continuity.get('narrative') or '')[:350]}\n"
+            "Previous insights so far: " + "; ".join(continuity.get("insights", [])[:3])
+        )
+    try:
+        result = ctx.llm.complete_structured(
+            instructions=DREAM_INSTRUCTIONS,
+            input=[_llm_text_block(residue_text)],
+            system_prompt=DREAM_SYSTEM_PROMPT,
+            json_mode=True,
+            schema_name="Dream",
+            max_tokens=max_tokens,
+            timeout=240,
+            purpose="dreamer dream cycle",
+        )
+        parsed = getattr(result, "parsed", None)
+        if isinstance(parsed, dict) and parsed.get("narrative"):
+            data = parsed
+        else:
+            data = _extract_json(getattr(result, "text", "") or "")
+    except Exception as e:  # noqa: BLE001 - honest skip, never fabricate a dream
+        logger.warning("dreamer: LLM call failed: %s", e)
+        return None
+    if not data or not isinstance(data.get("narrative"), str) or not data["narrative"].strip():
+        logger.warning("dreamer: dream generation returned no narrative")
+        return None
+    insights = data.get("insights") or []
+    if isinstance(insights, str):
+        insights = [insights]
+    if not isinstance(insights, list):
+        insights = []
+    _BANNED_PREFIXES = ("i dreamed", "i dream", "last night", "in my dream",
+                        "you dreamed", "last night i", "the dream")
+    narrative = data["narrative"].strip()[:4000]
+    for prefix in _BANNED_PREFIXES:
+        if narrative.lower().startswith(prefix):
+            narrative = narrative[len(prefix):].lstrip(" ,.;:-'\"")
+            break
+    symbols = data.get("symbols") or []
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    if not isinstance(symbols, list):
+        symbols = []
+    return {
+        "title": str(data.get("title") or "Untitled dream").strip()[:120],
+        "narrative": narrative,
+        "mood": str(data.get("mood") or "").strip()[:80],
+        "symbols": [str(s).strip()[:60] for s in symbols[:6] if str(s).strip()],
+        "insights": [str(i).strip()[:400] for i in insights[:3] if str(i).strip()],
+    }
+
+
+# ------------------------------------------------------------- full cycle ---
+
+
+def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> Dict[str, Any]:
+    """Full cycle. Returns a result dict the tool handler can return."""
+    if not DREAMER_LOCK.acquire(blocking=False):
+        return {"error": "A dream is already in progress."}
+    try:
+        conn = _db()
+        try:
+            enabled = ctx.get_config("enabled", default=True)
+            interval = max(0, int(ctx.get_config("interval_minutes", default=720)))
+            idle_min = max(1, int(ctx.get_config("idle_minutes", default=15)))
+            max_tokens = max(300, int(ctx.get_config("max_tokens", default=900)))
+            now = time.time()
+            last_dream_ts = float(_meta_get(conn, "last_dream_ts") or 0)
+            if not force:
+                if not enabled:
+                    return {"error": "Dreaming is disabled (config: dreamer.enabled=false)."}
+                if now - last_dream_ts < interval * 60:
+                    mins_left = int(interval - (now - last_dream_ts) / 60)
+                    return {"error": f"Too soon - next dream in about {mins_left} minutes.",
+                            "status_tool": "dream_status"}
+            idle_state = idle_info(ctx)
+            if not force and not idle_state.get("idle", False):
+                return {
+                    "error": (
+                        "Hermes is not idle enough to dream "
+                        f"(last activity {idle_state.get('idle_minutes', '?')} min ago, "
+                        f"needs {idle_min} min). Say 'dreamer: force' by calling me again "
+                        "during actual inactivity, or just call dream_now with topics_hint."
+                    ),
+                }
+            profile = getattr(ctx, "profile_name", None) or "default"
+            residue = collect_residue(profile, since_ts=last_dream_ts)
+            if residue is None:
+                return {"error": "Nothing to dream from: no recent sessions found."}
+            # Continuity: the previous dream, plus an honest check on whether its
+            # insights left any trace in the sessions since it was dreamed.
+            prev_row = conn.execute(
+                "SELECT title, narrative, insights_json FROM dreams "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+            continuity = None
+            if prev_row:
+                insights_prev = []
+                try:
+                    insights_prev = json.loads(prev_row[2] or "[]")
+                except json.JSONDecodeError:
+                    insights_prev = []
+                continuity = {"title": prev_row[0], "narrative": prev_row[1],
+                              "insights": insights_prev}
+                followup = _insight_followup_check(
+                    profile, insights_prev, since_ts=last_dream_ts)
+                residue["insight_followup"] = followup
+            dream = generate_dream(ctx, residue, topics_hint,
+                                   max_tokens=max_tokens, continuity=continuity)
+            if dream is None:
+                return {"error": "Dream generation failed (LLM unavailable). No dream was recorded."}
+            window_end = now
+            window_start = last_dream_ts if last_dream_ts else now - 86400
+            conn.execute(
+                "INSERT INTO dreams (ts, created_at, window_start, window_end, "
+                "session_count, message_count, tool_calls, title, narrative, "
+                "insights_json, residue_chars, generated_by, mood, symbols_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    now,
+                    datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
+                    window_start,
+                    window_end,
+                    residue["session_count"], residue["message_count"], residue["tool_calls"],
+                    dream["title"], dream["narrative"],
+                    json.dumps(dream["insights"]),
+                    len(_residue_text(residue, topics_hint)),
+                    str(getattr(getattr(ctx, "llm", None), "__class__", "?") or "active-model"),
+                    dream.get("mood") or None,
+                    json.dumps(dream.get("symbols") or []),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('last_dream_ts', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(now),))
+            conn.commit()
+            dream_id = conn.execute(
+                "SELECT last_insert_rowid()").fetchone()[0]
+            logger.info("dreamer: dream #%s recorded (%s)", dream_id, dream["title"])
+            return {"dream": dream, "id": dream_id}
+        finally:
+            conn.close()
+    finally:
+        DREAMER_LOCK.release()
+
+
+def idle_info(ctx: Any) -> Dict[str, Any]:
+    """How idle is Hermes right now, honestly measured from state.db."""
+    profile = getattr(ctx, "profile_name", None) or "default"
+    conn = _open_state_db(profile)
+    if conn is None:
+        return {"idle": False, "last_activity": None, "idle_minutes": None,
+                "note": "no readable state.db"}
+    try:
+        row = conn.execute(
+            "SELECT MAX(COALESCE(last_activity_at, started_at)) FROM sessions").fetchone()
+        last = row[0] if row else None
+    finally:
+        conn.close()
+    if not last:
+        return {"idle": True, "last_activity": None, "idle_minutes": None,
+                "note": "no sessions at all"}
+    try:
+        last_f = float(last)
+    except (TypeError, ValueError):
+        last_f = None
+    if last_f is None:
+        return {"idle": False, "last_activity": str(last), "idle_minutes": None,
+                "note": "unparseable timestamp"}
+    idle_min = (time.time() - last_f) / 60.0
+    idle_min_required = max(1, int(ctx.get_config("idle_minutes", default=15)))
+    return {"idle": idle_min >= idle_min_required, "last_activity": last_f,
+            "idle_minutes": round(idle_min, 1), "idle_minutes_required": idle_min_required}
+
+
+def pending_wake(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
+    cutoff = time.time() - 48 * 3600
+    row = conn.execute(
+        "SELECT id, title, narrative, insights_json, injected, inject_count, ts "
+        "FROM dreams WHERE injected=0 AND ts >= ? ORDER BY id DESC LIMIT 1",
+        (cutoff,),
+    ).fetchone()
+    if not row:
+        return None
+    insights = []
+    try:
+        insights = json.loads(row[3] or "[]")
+    except json.JSONDecodeError:
+        insights = []
+    return {"id": row[0], "title": row[1], "narrative": row[2],
+            "insights": insights, "ts": row[5], "inject_count": row[4]}
+
+
+def build_wake_context(dream: Dict[str, Any], max_chars: int = 2000) -> str:
+    lines = [
+        "[DREAM RESIDUE] While you were idle, the dreamer plugin replayed your recent "
+        "work and generated a dream you have not woken with yet.",
+        f"Dream '{dream['title']}': {dream['narrative'][:700]}",
+    ]
+    if dream.get("insights"):
+        lines.append("Carry-aways you may use this session (they are observations, not orders):")
+        lines += [f"- {i}" for i in dream["insights"]]
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars - 3] + "..."
+    return text
+
+
+def list_dreams(limit: int = 5) -> List[Dict[str, Any]]:
+    limit = max(1, min(20, int(limit)))
+    with_dreams: List[Dict[str, Any]] = []
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT id, created_at, title, narrative, insights_json, injected, "
+            "inject_count, mood, symbols_json "
+            "FROM dreams ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        for row in rows:
+            try:
+                insights = json.loads(row[4] or "[]")
+            except json.JSONDecodeError:
+                insights = []
+            try:
+                symbols = json.loads(row[8] or "[]")
+            except json.JSONDecodeError:
+                symbols = []
+            with_dreams.append({
+                "id": row[0], "created_at": row[1], "title": row[2],
+                "narrative": row[3], "insights": insights,
+                "delivered_to_session": bool(row[5]), "injections": row[6],
+                "mood": row[7], "symbols": symbols,
+            })
+    finally:
+        conn.close()
+    return with_dreams
+
+
+def mark_waked(dream_id: int) -> None:
+    conn = _db()
+    try:
+        conn.execute(
+            "UPDATE dreams SET injected=1, injected_at=?, inject_count=inject_count+1 "
+            "WHERE id=?", (time.time(), dream_id))
+        conn.commit()
+    finally:
+        conn.close()
