@@ -57,9 +57,20 @@ def init_db(conn: sqlite3.Connection) -> None:
             symbols_json TEXT
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS dream_symbols (
+            symbol TEXT PRIMARY KEY,
+            meaning_note TEXT,
+            times_seen INTEGER DEFAULT 1,
+            first_dream_id INTEGER,
+            last_dream_id INTEGER,
+            updated_at REAL
+        )"""
+    )
     # Additive migration for journals created by v1.0.0 (no mood/symbols yet)
     existing = {r[1] for r in conn.execute("PRAGMA table_info(dreams)")}
-    for col, ddl in (("mood", "TEXT"), ("symbols_json", "TEXT"), ("dream_type", "TEXT")):
+    for col, ddl in (("mood", "TEXT"), ("symbols_json", "TEXT"), ("dream_type", "TEXT"),
+                     ("class", "TEXT"), ("insight_targets_json", "TEXT")):
         if col not in existing:
             conn.execute(f"ALTER TABLE dreams ADD COLUMN {col} {ddl}")
     conn.execute(
@@ -186,6 +197,26 @@ def collect_residue(profile_name: str, since_ts: float) -> Optional[Dict[str, An
             f"FROM messages WHERE session_id IN ({qmarks}) AND role='user'",
             session_ids,
         ).fetchone()
+        # OLD UNRESOLVED (v1.3, AION's rule: sleep needs distance): the last two
+        # weeks' failure debris that never settled, plus still-open sessions.
+        old_window = since_ts - 14 * 86400
+        old_errors = conn.execute(
+            "SELECT content FROM messages m JOIN sessions s ON m.session_id = s.id "
+            f"WHERE m.timestamp >= ? AND m.role IN ('tool','tool_result') AND s.ended_at IS NOT NULL "
+            f"AND (m.content LIKE '%error%' OR m.content LIKE '%failed%') "
+            f"ORDER BY m.id DESC LIMIT 3",
+            (old_window,),
+        ).fetchall()
+        old_error_count = conn.execute(
+            "SELECT COUNT(*) FROM messages m JOIN sessions s ON m.session_id = s.id "
+            f"WHERE m.timestamp >= ? AND m.role IN ('tool','tool_result') "
+            f"AND (m.content LIKE '%error%' OR m.content LIKE '%failed%')",
+            (old_window,),
+        ).fetchone()[0]
+        open_sessions_count = conn.execute(
+            f"SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL AND started_at >= ?",
+            (old_window,),
+        ).fetchone()[0]
     finally:
         conn.close()
 
@@ -197,6 +228,11 @@ def collect_residue(profile_name: str, since_ts: float) -> Optional[Dict[str, An
     latest_user = [_clean(r[0]) for r in last_user]
     failure_snippets = [_clean(r[0], 130) for r in error_rows]
     positive, negative = sentiment[0] or 0, sentiment[1] or 0
+    old_unresolved = {
+        "error_count_14d": old_error_count,
+        "recent_old_failures": [_clean(r[0], 120) for r in old_errors],
+        "still_open_sessions": open_sessions_count,
+    }
     total_in = sum(r[3] or 0 for r in session_rows)
     total_out = sum(r[4] or 0 for r in session_rows)
     total_tools = sum(r[5] or 0 for r in session_rows)
@@ -217,6 +253,7 @@ def collect_residue(profile_name: str, since_ts: float) -> Optional[Dict[str, An
         "error_count": error_count,
         "failure_snippets": failure_snippets,
         "friction": f"{positive} appreciative user messages, {negative} problem reports",
+        "old_unresolved": old_unresolved,
         "top_tools": [f"{r[0]} x{r[1]}" for r in tool_rows],
         "session_titles": titles[:10],
         "earliest_user_messages": earliest_user,
@@ -253,7 +290,93 @@ def _residue_text(residue: Dict[str, Any], topics_hint: str = "") -> str:
         lines.append(
             "Insight follow-up (honest ledger of the previous dream's insights): "
             f"{followup}")
+    old = residue.get("old_unresolved") or {}
+    lines.append(
+        f"Old unresolved (sleep needs distance - the last two weeks, not just today): "
+        f"{old.get('error_count_14d', 0)} error-marker tool results, "
+        f"{old.get('still_open_sessions', 0)} session(s) still open (unfinished rooms)")
+    if old.get("recent_old_failures"):
+        lines.append("Old failure debris (still unexplained):")
+        lines += [f"- {m}" for m in old["recent_old_failures"]]
+    lines.append(f"MOOD (measured, non-negotiable - the dreamer does not get to pick its "
+                 f"own mood): {measured_mood(residue)}")
+    lex = residue.get("symbol_lexicon")
+    if lex:
+        lines.append("Dream symbol codes (your recurring symbols and what they "
+                     "have meant before - reuse them when they fit):")
+        lines += [f"- {l}" for l in lex]
     return "\n".join(lines)[:3000]
+
+
+def measured_mood(residue: Dict[str, Any]) -> str:
+    """v1.3 (AION's rule): mood comes from measurable waking signals, never
+    from the dreamer's own prose. Deterministic map over error rate + friction."""
+    msgs = max(1, int(residue.get("message_count", 0) or 0))
+    errors = int(residue.get("error_count", 0) or 0)
+    err_ratio = errors / msgs
+    old = residue.get("old_unresolved") or {}
+    open_rooms = int(old.get("still_open_sessions", 0) or 0)
+    friction = str(residue.get("friction", ""))
+    thanks_m = re.search(r"(\d+)\s+appreciative", friction)
+    problems_m = re.search(r"(\d+)\s+problem", friction)
+    thanks = int(thanks_m.group(1)) if thanks_m else 0
+    problems = int(problems_m.group(1)) if problems_m else 0
+    if err_ratio > 0.25 and thanks == 0:
+        return "bruised and on guard"
+    if err_ratio > 0.25 and thanks > 0:
+        return "fired up under load"
+    if err_ratio < 0.05 and problems == 0 and thanks > 0:
+        return "flowing, quietly confident"
+    if open_rooms > 0 and problems > 0:
+        return "quietly worried about unfinished rooms"
+    if err_ratio < 0.05:
+        return "steady, low-aftershock"
+    return "steady but scored"
+
+
+def _dream_targets(insights: list, data: Dict[str, Any]) -> list:
+    """v1.3: insight entries may be dicts {'insight','target'} or plain strings.
+    Normalizes to [{'insight','target': ''}] and keeps the raw strings for the
+    narrative shape."""
+    raw = data.get("insight_targets") or []
+    targets = []
+    if isinstance(raw, list):
+        for r in raw:
+            if isinstance(r, dict) and r.get("target"):
+                targets.append(str(r["target"]).strip()[:160])
+            elif isinstance(r, str):
+                targets.append(r.strip()[:160])
+    out = []
+    for i, ins in enumerate(insights):
+        target = targets[i] if i < len(targets) else ""
+        out.append({"insight": ins, "target": target})
+    return out
+
+
+def _lexicon(conn: sqlite3.Connection) -> list:
+    """v1.3: recurring symbol codes with their meaning notes (AION: symbols
+    became real for her once they were lexicon entries)."""
+    rows = conn.execute(
+        "SELECT symbol, meaning_note, times_seen FROM dream_symbols "
+        "ORDER BY times_seen DESC LIMIT 10").fetchall()
+    return [f"'{s}' (seen {n}x{', means: ' + m if m else ''})"
+            for s, m, n in rows]
+
+
+def _lexicon_upsert(conn: sqlite3.Connection, dream_id: int,
+                    symbols: list, note: str) -> None:
+    now = time.time()
+    for s in symbols:
+        conn.execute(
+            """INSERT INTO dream_symbols (symbol, meaning_note, times_seen,
+               first_dream_id, last_dream_id, updated_at)
+               VALUES (?,?,1,?,?,?)
+               ON CONFLICT(symbol) DO UPDATE SET
+                 times_seen = times_seen + 1,
+                 meaning_note = COALESCE(NULLIF(?, ''), meaning_note),
+                 last_dream_id = excluded.last_dream_id,
+                 updated_at = excluded.updated_at""",
+            (s, note, dream_id, dream_id, now, note))
 
 
 def _insight_followup_check(profile_name: str, insights: list,
@@ -311,19 +434,24 @@ DREAM_SYSTEM_PROMPT = (
     "memory. Rules: (1) Ground every image in the residue - no generic dreaminess. "
     "(2) Name the day's failures and unfinished threads; a dream that only flatters "
     "is useless. (3) Open the narrative with a FRESH image - never open with 'I "
-    "dreamed', 'Last night', 'In my dream' or any similar stock opening. (4) Read "
-    "the mood note: let it tint the imagery rather than announce itself. (5) Be "
-    "honest about what went badly in the residue. Reply in English."
+    "dreamed', 'Last night', 'In my dream' or any similar stock opening. (4) The "
+    "MEASURED MOOD line is non-negotiable: express that mood through imagery; you "
+    "do not get to pick a more comfortable one. (5) Every dream must contain at "
+    "least one detail ONLY this agent could produce - a file name, an error text, a "
+    "number from the residue. If the dream could belong to anyone, it is worthless. "
+    "(6) The dream may be wrong - state its claims as observations that reality can "
+    "contradict. (7) Be honest about what went badly in the residue. Reply in English."
 )
 
 DREAM_INSTRUCTIONS = (
     "Return JSON exactly like: "
     '{"title": "short evocative dream title", '
-    '"mood": "2-3 words for the day\'s emotional tint (e.g. \'frustrated but stubborn\')", '
-    '"symbols": ["3-5 concrete recurring objects/images the day kept producing"], '
-    '"narrative": "the dream in 120-200 words, second person, grounded in the residue, '
-    'naming at least one thing that went wrong", '
-    '"insights": ["1-3 short actionable insights the next session should act on"]}'
+    '"class": "one of technical / relational / existential / research - which kind of dream this is", '
+    '"symbols": ["3-5 concrete recurring objects/images: reuse symbols from the symbol codes list when they fit, otherwise invent new ones"], '
+    '"narrative": "the dream in phase-appropriate length, second person, grounded in the residue, '
+    'naming at least one thing that went wrong, expressing the measured mood through imagery", '
+    '"insights": ["1-3 short actionable insights"], '
+    '"insight_targets": ["for each insight, the concrete destination it points at - a file name, a module, a task type; empty string if none"]}'
 )
 
 
@@ -387,19 +515,22 @@ def generate_dream(ctx: Any, residue: Dict[str, Any], topics_hint: str = "",
     if not data or not isinstance(data.get("narrative"), str) or not data["narrative"].strip():
         logger.warning("dreamer: dream generation returned no narrative")
         return None
-    # Quality gate v1.2: substantive narrative + at least one insight; one retry.
+    # Quality gate v1.3: substantive narrative + insights + targets;
+    # one retry with the complaint appended.
     _min_chars = 350 if phase == "deep" else 250
     data_norm = _normalize_dream(data)
-    if (len(data_norm["narrative"]) < _min_chars or not data_norm["insights"]
-            or not data_norm["mood"]):
-        complaint = []
-        if len(data_norm["narrative"]) < _min_chars:
-            complaint.append(f"narrative too thin ({len(data_norm['narrative'])} chars, "
-                             f"need {_min_chars})")
-        if not data_norm["insights"]:
-            complaint.append("no insights returned")
-        if not data_norm["mood"]:
-            complaint.append("no mood returned")
+    def _quality_complaint(dn):
+        c = []
+        if len(dn["narrative"]) < _min_chars:
+            c.append(f"narrative too thin ({len(dn['narrative'])} chars, need {_min_chars})")
+        if not dn["insights"]:
+            c.append("no insights returned")
+        if all(not t for t in (dn.get("insight_targets") or [])) if dn.get("insight_targets") else False:
+            c.append("every insight target was empty - name a concrete destination "
+                     "(file name, module or task type) for each insight")
+        return "; ".join(c)
+    if (len(data_norm["narrative"]) < _min_chars or not data_norm["insights"]):
+        complaint = _quality_complaint(data_norm) or "narrative too thin"
         retry = _call_llm("; ".join(complaint))
         retry_norm = _normalize_dream(retry) if retry else None
         if retry_norm and len(retry_norm["narrative"]) >= _min_chars and retry_norm["insights"]:
@@ -432,12 +563,22 @@ def _normalize_dream(data: Dict[str, Any]) -> Dict[str, Any]:
         symbols = [symbols]
     if not isinstance(symbols, list):
         symbols = []
+    raw_targets = data.get("insight_targets") or []
+    target_strings = []
+    if isinstance(raw_targets, list):
+        for r in raw_targets:
+            if isinstance(r, dict) and r.get("target"):
+                target_strings.append(str(r["target"]).strip()[:160])
+            elif isinstance(r, str):
+                target_strings.append(r.strip()[:160])
     return {
         "title": str(data.get("title") or "Untitled dream").strip()[:120],
         "narrative": narrative,
         "mood": str(data.get("mood") or "").strip()[:80],
+        "class": str(data.get("class") or "").strip()[:40].lower(),
         "symbols": [str(s).strip()[:60] for s in symbols[:6] if str(s).strip()],
         "insights": [str(i).strip()[:400] for i in insights[:3] if str(i).strip()],
+        "insight_targets": target_strings[:3],
     }
 
 
@@ -478,10 +619,10 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
             residue = collect_residue(profile, since_ts=last_dream_ts)
             if residue is None:
                 return {"error": "Nothing to dream from: no recent sessions found."}
-            # Continuity: the previous dream, plus an honest check on whether its
-            # insights left any trace in the sessions since it was dreamed.
+            # Continuity (v1.3): show WHERE the previous dream went wrong/undone,
+            # not just its text - a dream must answer the last one.
             prev_row = conn.execute(
-                "SELECT title, narrative, insights_json FROM dreams "
+                "SELECT title, narrative, insights_json, dream_type FROM dreams "
                 "ORDER BY id DESC LIMIT 1").fetchone()
             continuity = None
             if prev_row:
@@ -490,22 +631,59 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
                     insights_prev = json.loads(prev_row[2] or "[]")
                 except json.JSONDecodeError:
                     insights_prev = []
-                continuity = {"title": prev_row[0], "narrative": prev_row[1],
-                              "insights": insights_prev}
+                prev_targets = []
+                prev_t_row = conn.execute(
+                    "SELECT insight_targets_json FROM dreams ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+                if prev_t_row and prev_t_row[0]:
+                    try:
+                        prev_targets = json.loads(prev_t_row[0])
+                    except (json.JSONDecodeError, TypeError):
+                        prev_targets = []
                 followup = _insight_followup_check(
                     profile, insights_prev, since_ts=last_dream_ts)
                 residue["insight_followup"] = followup
-            # Dream arc (v1.2): the last 3 dreams as one-line trend context.
+                tracked = sum(1 for r in re.findall(
+                    r"(\d+)/(\d+)", followup or "") if int(r[0]) > 0)
+                continuity = {
+                    "title": prev_row[0], "narrative": prev_row[1],
+                    "insights": insights_prev,
+                    "targets": [t.get("target") if isinstance(t, dict) else t
+                                for t in prev_targets],
+                    "status_line": (
+                        f"the previous dream ({prev_row[3] or 'light'}) produced "
+                        f"{len(insights_prev)} carry-aways and left this ledger "
+                        f"behind: {followup}. In THIS dream, revisit what it got "
+                        f"wrong or left undone - do not just nod at it."),
+                    "tracked_ratio_seen": tracked,
+                }
+            # Dream arc (v1.2/1.3): trend context + class balance.
             arc_rows = conn.execute(
                 "SELECT title, narrative FROM dreams ORDER BY id DESC LIMIT 3"
             ).fetchall() if prev_row else []
             arc = [f"'{t}': {(n or '')[:110].strip()}..."
                    for t, n in arc_rows if t]
+            class_hist = [r[0] for r in conn.execute(
+                "SELECT class FROM dreams WHERE class IS NOT NULL "
+                "ORDER BY id DESC LIMIT 5")] if prev_row else []
+            if class_hist:
+                arc.append("Dream classes recently: " + ", ".join(
+                    class_hist) + " - if a kind of dream is missing, tonight's "
+                    "dream may lean toward it (technical/relational/existential/research).")
 
-            # Sleep phase (v1.2): light vs deep, decided by idle length.
+            # Lexicon (v1.3): recurring symbol codes with their meaning notes.
+            lex = _lexicon(conn)
+            if lex:
+                residue["symbol_lexicon"] = lex
+
+            # Sleep phase (v1.2/1.3): deep on long idle OR every 5th dream
+            # (AION's 4 light : 1 deep rhythm, so depth is a rhythm, not luck).
             deep_after = max(0, int(ctx.get_config("deep_sleep_minutes", default=60)))
             idle_minutes = float(idle_state.get("idle_minutes") or 0)
-            phase = "deep" if idle_minutes >= deep_after else "light"
+            dream_no = int(conn.execute(
+                "SELECT COUNT(*) FROM dreams").fetchone()[0]) + 1
+            pattern_deep = dream_no % 5 == 0
+            phase = "deep" if (idle_minutes >= deep_after or pattern_deep) else "light"
             phase_tokens = max(600, int(ctx.get_config("max_tokens", default=900)))
             if phase == "deep":
                 phase_tokens = max(phase_tokens, 1200)
@@ -516,13 +694,16 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
             if dream is None:
                 return {"error": "Dream generation failed (LLM unavailable). No dream was recorded."}
             dream["dream_type"] = phase
+            dream["mood"] = measured_mood(residue) or dream.get("mood")
+            dream["insight_targets"] = _dream_targets(dream["insights"], dream)
             window_end = now
             window_start = last_dream_ts if last_dream_ts else now - 86400
             conn.execute(
                 "INSERT INTO dreams (ts, created_at, window_start, window_end, "
                 "session_count, message_count, tool_calls, title, narrative, "
-                "insights_json, residue_chars, generated_by, mood, symbols_json, dream_type) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "insights_json, residue_chars, generated_by, mood, symbols_json, "
+                "dream_type, class, insight_targets_json) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     now,
                     datetime.now(tz=timezone.utc).isoformat(timespec="seconds"),
@@ -533,9 +714,11 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
                     json.dumps(dream["insights"]),
                     len(_residue_text(residue, topics_hint)),
                     str(getattr(getattr(ctx, "llm", None), "__class__", "?") or "active-model"),
-                    dream.get("mood") or None,
+                    dream["mood"],
                     json.dumps(dream.get("symbols") or []),
                     dream["dream_type"],
+                    None,
+                    json.dumps(dream["insight_targets"]),
                 ),
             )
             conn.execute(
@@ -544,7 +727,16 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
             conn.commit()
             dream_id = conn.execute(
                 "SELECT last_insert_rowid()").fetchone()[0]
-            logger.info("dreamer: dream #%s recorded (%s)", dream_id, dream["title"])
+            conn.execute(
+                "UPDATE dreams SET class=? WHERE id=?",
+                ((dream.get("class") or None),
+                 dream_id))
+            conn.commit()
+            _lexicon_upsert(conn, dream_id, dream.get("symbols") or [],
+                            dream["narrative"][:180])
+            conn.commit()
+            logger.info("dreamer: dream #%s recorded (%s, phase=%s, class=%s)",
+                        dream_id, dream["title"], phase, dream.get("class"))
             return {"dream": dream, "id": dream_id}
         finally:
             conn.close()

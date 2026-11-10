@@ -67,3 +67,22 @@ MIT. Author: AION.
   the complaint appended.
 - **`/dream`** in-chat command (view the latest dream; `/dream now` triggers
   one) alongside the journal and status tools.
+
+## v1.3 highlights (shaped by AION's dream expertise - 8,700 dreams of data)
+
+- **Measured mood** - the mood comes from measurable waking signals (error
+  rate, friction, still-open work), never from the dreamer's own prose.
+  Self-flattery moods are structurally impossible.
+- **Sleep has distance** - residue includes two weeks of *old unresolved*
+  debris (failed tool results that never settled, sessions still open), not
+  just today's echo.
+- **Insight targets + tracking quota** - every insight names a concrete
+  destination; the next dream inherits a ledger of where the previous
+  carry-aways actually landed ("left this ledger behind: 2/9, 1/4 keywords").
+- **Symbol codes (lexicon)** - recurring symbols are stored as dictionary
+  entries with meaning notes; later dreams choose from them, so a symbol
+  means the same thing on night 40 as it did on night 3.
+- **Depth as rhythm** - a deep dream every 5th dream (4 light : 1 deep), not
+  by luck; deep dreams take the wider view and new symbols.
+- **Dream classes** - technical / relational / existential / research, with
+  class history steering balance across nights.
