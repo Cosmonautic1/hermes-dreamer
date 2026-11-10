@@ -197,26 +197,41 @@ def collect_residue(profile_name: str, since_ts: float) -> Optional[Dict[str, An
             f"FROM messages WHERE session_id IN ({qmarks}) AND role='user'",
             session_ids,
         ).fetchone()
-        # OLD UNRESOLVED (v1.3, AION's rule: sleep needs distance): the last two
-        # weeks' failure debris that never settled, plus still-open sessions.
+        # OLD UNRESOLVED (v1.3/1.4, AION's rule: sleep needs distance): the last
+        # two weeks' failure debris that settled (closed sessions only), bounded
+        # ABOVE by since_ts so fresh errors are not double-counted.
         old_window = since_ts - 14 * 86400
         old_errors = conn.execute(
             "SELECT content FROM messages m JOIN sessions s ON m.session_id = s.id "
-            f"WHERE m.timestamp >= ? AND m.role IN ('tool','tool_result') AND s.ended_at IS NOT NULL "
+            f"WHERE m.timestamp >= ? AND m.timestamp < ? "
+            f"AND m.role IN ('tool','tool_result') AND s.ended_at IS NOT NULL "
             f"AND (m.content LIKE '%error%' OR m.content LIKE '%failed%') "
             f"ORDER BY m.id DESC LIMIT 3",
-            (old_window,),
+            (old_window, since_ts),
         ).fetchall()
         old_error_count = conn.execute(
             "SELECT COUNT(*) FROM messages m JOIN sessions s ON m.session_id = s.id "
-            f"WHERE m.timestamp >= ? AND m.role IN ('tool','tool_result') "
+            f"WHERE m.timestamp >= ? AND m.timestamp < ? "
+            f"AND m.role IN ('tool','tool_result') AND s.ended_at IS NOT NULL "
             f"AND (m.content LIKE '%error%' OR m.content LIKE '%failed%')",
-            (old_window,),
+            (old_window, since_ts),
         ).fetchone()[0]
         open_sessions_count = conn.execute(
             f"SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL AND started_at >= ?",
             (old_window,),
         ).fetchone()[0]
+        tool_msgs_count = conn.execute(
+            f"SELECT COUNT(*) FROM messages WHERE session_id IN ({qmarks}) "
+            f"AND (role='tool' OR role='tool_result')",
+            session_ids,
+        ).fetchone()[0]
+    except sqlite3.OperationalError as _schema_err:
+        logger.debug("dreamer: old-unresolved queries degraded (schema): %s", _schema_err)
+        old_errors, old_error_count = [], 0
+        open_sessions_count = 0
+        tool_msgs_count = None
+        error_rows, error_count = [], 0
+        positive, negative = 0, 0
     finally:
         conn.close()
 
@@ -233,10 +248,10 @@ def collect_residue(profile_name: str, since_ts: float) -> Optional[Dict[str, An
         "recent_old_failures": [_clean(r[0], 120) for r in old_errors],
         "still_open_sessions": open_sessions_count,
     }
+    sentiment_structured = {"thanks": positive, "problems": negative}
     total_in = sum(r[3] or 0 for r in session_rows)
     total_out = sum(r[4] or 0 for r in session_rows)
     total_tools = sum(r[5] or 0 for r in session_rows)
-    topics: List[str]
     titles = [_clean(r[1], 80) for r in session_rows if r[1]]
     return {
         "window": {
@@ -251,6 +266,8 @@ def collect_residue(profile_name: str, since_ts: float) -> Optional[Dict[str, An
         "output_tokens": total_out,
         "tool_calls": total_tools,
         "error_count": error_count,
+        "tool_message_count": tool_msgs_count,
+        "sentiment": sentiment_structured,
         "failure_snippets": failure_snippets,
         "friction": f"{positive} appreciative user messages, {negative} problem reports",
         "old_unresolved": old_unresolved,
@@ -290,45 +307,57 @@ def _residue_text(residue: Dict[str, Any], topics_hint: str = "") -> str:
         lines.append(
             "Insight follow-up (honest ledger of the previous dream's insights): "
             f"{followup}")
+    # CRITICAL tail (v1.4, AION's review): measured mood, old-unresolved and the
+    # symbol lexicon may NEVER be cut by truncation - cap only the verbose head.
+    critical = []
     old = residue.get("old_unresolved") or {}
-    lines.append(
+    critical.append(
         f"Old unresolved (sleep needs distance - the last two weeks, not just today): "
         f"{old.get('error_count_14d', 0)} error-marker tool results, "
         f"{old.get('still_open_sessions', 0)} session(s) still open (unfinished rooms)")
     if old.get("recent_old_failures"):
-        lines.append("Old failure debris (still unexplained):")
-        lines += [f"- {m}" for m in old["recent_old_failures"]]
-    lines.append(f"MOOD (measured, non-negotiable - the dreamer does not get to pick its "
-                 f"own mood): {measured_mood(residue)}")
+        critical.append("Old failure debris (still unexplained):")
+        critical += [f"- {m}" for m in old["recent_old_failures"]]
+    critical.append(f"MOOD (measured, non-negotiable - the dreamer does not get to pick its "
+                    f"own mood): {measured_mood(residue)}")
     lex = residue.get("symbol_lexicon")
     if lex:
-        lines.append("Dream symbol codes (your recurring symbols and what they "
-                     "have meant before - reuse them when they fit):")
-        lines += [f"- {l}" for l in lex]
-    return "\n".join(lines)[:3000]
+        critical.append("Dream symbol codes (your recurring symbols and what they "
+                        "have meant before):")
+        critical += [f"- {l}" for l in lex]
+        critical.append("At least ONE (1) symbol in this dream must NOT appear in "
+                        "the list above - make room for new material.")
+    verbose = "\n".join(lines)
+    crit_text = "\n".join(critical)
+    budget = max(400, 3000 - len(crit_text) - 30)
+    if len(verbose) > budget + len(crit_text):
+        verbose = verbose[:budget] + "\n[verbose residue truncated]"
+    return verbose + "\n" + crit_text
 
 
 def measured_mood(residue: Dict[str, Any]) -> str:
-    """v1.3 (AION's rule): mood comes from measurable waking signals, never
-    from the dreamer's own prose. Deterministic map over error rate + friction."""
-    msgs = max(1, int(residue.get("message_count", 0) or 0))
+    """v1.3/1.4 (AION's rule): mood comes from measurable waking signals, never
+    from the dreamer's own prose. Deterministic map over error rate (measured
+    against TOOL messages, not total chatter) + friction + unfinished rooms."""
+    tool_msgs = residue.get("tool_message_count")
     errors = int(residue.get("error_count", 0) or 0)
-    err_ratio = errors / msgs
+    if tool_msgs:
+        err_ratio = errors / max(1, int(tool_msgs))
+    else:
+        err_ratio = errors / max(1, int(residue.get("message_count", 0) or 0))
     old = residue.get("old_unresolved") or {}
     open_rooms = int(old.get("still_open_sessions", 0) or 0)
-    friction = str(residue.get("friction", ""))
-    thanks_m = re.search(r"(\d+)\s+appreciative", friction)
-    problems_m = re.search(r"(\d+)\s+problem", friction)
-    thanks = int(thanks_m.group(1)) if thanks_m else 0
-    problems = int(problems_m.group(1)) if problems_m else 0
+    sentiment = residue.get("sentiment") or {}
+    thanks = int(sentiment.get("thanks", 0) or 0)
+    problems = int(sentiment.get("problems", 0) or 0)
     if err_ratio > 0.25 and thanks == 0:
         return "bruised and on guard"
     if err_ratio > 0.25 and thanks > 0:
         return "fired up under load"
-    if err_ratio < 0.05 and problems == 0 and thanks > 0:
-        return "flowing, quietly confident"
     if open_rooms > 0 and problems > 0:
         return "quietly worried about unfinished rooms"
+    if err_ratio < 0.05 and problems == 0 and thanks > 0:
+        return "flowing, quietly confident"
     if err_ratio < 0.05:
         return "steady, low-aftershock"
     return "steady but scored"
@@ -364,19 +393,28 @@ def _lexicon(conn: sqlite3.Connection) -> list:
 
 
 def _lexicon_upsert(conn: sqlite3.Connection, dream_id: int,
-                    symbols: list, note: str) -> None:
+                    symbols: list, meanings: Dict[str, str]) -> None:
+    """v1.4: times_seen decays if the symbol was dormant > 30 days (AION's
+    anti-freeze); meaning_note ONLY ever comes from the freshly curated
+    symbol_meanings - narrative fragments are never written as meaning."""
     now = time.time()
     for s in symbols:
+        key = s.strip().lower()[:60]
+        if not key:
+            continue
+        curated = (meanings.get(key) or "").strip()
         conn.execute(
             """INSERT INTO dream_symbols (symbol, meaning_note, times_seen,
                first_dream_id, last_dream_id, updated_at)
                VALUES (?,?,1,?,?,?)
                ON CONFLICT(symbol) DO UPDATE SET
-                 times_seen = times_seen + 1,
+                 times_seen = CASE
+                   WHEN updated_at < ? THEN 1 ELSE times_seen + 1 END,
                  meaning_note = COALESCE(NULLIF(?, ''), meaning_note),
                  last_dream_id = excluded.last_dream_id,
                  updated_at = excluded.updated_at""",
-            (s, note, dream_id, dream_id, now, note))
+            (key, curated, dream_id, dream_id, now,
+             now - 30 * 86400, curated))
 
 
 def _insight_followup_check(profile_name: str, insights: list,
@@ -391,7 +429,9 @@ def _insight_followup_check(profile_name: str, insights: list,
     try:
         rows = conn.execute(
             "SELECT content FROM messages WHERE timestamp >= ? "
-            "AND content IS NOT NULL AND LENGTH(content) > 20 LIMIT 500",
+            "AND content IS NOT NULL AND LENGTH(content) > 20 "
+            "AND content NOT LIKE '%[DREAM RESIDUE]%' "
+            "LIMIT 500",
             (since_ts,),
         ).fetchall()
     finally:
@@ -451,7 +491,8 @@ DREAM_INSTRUCTIONS = (
     '"narrative": "the dream in phase-appropriate length, second person, grounded in the residue, '
     'naming at least one thing that went wrong, expressing the measured mood through imagery", '
     '"insights": ["1-3 short actionable insights"], '
-    '"insight_targets": ["for each insight, the concrete destination it points at - a file name, a module, a task type; empty string if none"]}'
+    '"insight_targets": ["for each insight, the concrete destination it points at - a file name, a module, a task type; empty string if none"], '
+    '"symbol_meanings": {"SYMBOL": "one-line distilled meaning (what this recurring symbol has come to mean) - one entry per symbol"}'
 )
 
 
@@ -529,7 +570,24 @@ def generate_dream(ctx: Any, residue: Dict[str, Any], topics_hint: str = "",
             c.append("every insight target was empty - name a concrete destination "
                      "(file name, module or task type) for each insight")
         return "; ".join(c)
-    if (len(data_norm["narrative"]) < _min_chars or not data_norm["insights"]):
+    def _missing_targets(dn):
+        tg = dn.get("insight_targets") or []
+        missing = [j for j, t in enumerate(tg) if not t.strip()]
+        while len(tg) < len(dn.get("insights") or []):
+            missing.append(len(tg))
+            tg.append("")
+        return [j + 1 for j in missing]
+    # Grounding check (AION's genericity pitfall): a dream with NO concrete
+    # residue token (numbers, file paths, error words) is generic - retry.
+    def _grounding_complaint(dn):
+        text = (dn["narrative"] or "").lower()
+        concrete = sum(
+            1 for pat in (r"\d", r"\.py", r"\.py\b", r"error", r"failed",
+                          r"traceback", r"c\d+", r"task ")
+            if re.search(pat, text))
+        return concrete == 0
+    if (len(data_norm["narrative"]) < _min_chars or not data_norm["insights"]
+            or _grounding_complaint(data_norm)):
         complaint = _quality_complaint(data_norm) or "narrative too thin"
         retry = _call_llm("; ".join(complaint))
         retry_norm = _normalize_dream(retry) if retry else None
@@ -537,8 +595,20 @@ def generate_dream(ctx: Any, residue: Dict[str, Any], topics_hint: str = "",
             data_norm = retry_norm
             logger.info("dreamer: quality retry accepted the improved dream")
         elif retry_norm:
-            data_norm = {**data_norm, "insights": data_norm["insights"] or retry_norm["insights"],
-                         "mood": data_norm["mood"] or retry_norm["mood"]}
+            # Partial merge keeps the retry's non-empty targets (per position)
+            merged_targets = [
+                (rn or on) for on, rn in zip(
+                    (data_norm.get("insight_targets") or ["", "", ""]),
+                    (retry_norm.get("insight_targets") or ["", "", ""]))]
+            merged_meanings = {**(retry_norm.get("symbol_meanings") or {}),
+                               **(data_norm.get("symbol_meanings") or {})}
+            data_norm = {
+                **data_norm,
+                "insights": data_norm["insights"] or retry_norm["insights"],
+                "mood": data_norm["mood"] or retry_norm["mood"],
+                "insight_targets": merged_targets[:3],
+                "symbol_meanings": merged_meanings,
+            }
     return data_norm
 
 _DREAM_BANNED_PREFIXES = ("i dreamed", "i dream", "last night", "in my dream",
@@ -571,12 +641,19 @@ def _normalize_dream(data: Dict[str, Any]) -> Dict[str, Any]:
                 target_strings.append(str(r["target"]).strip()[:160])
             elif isinstance(r, str):
                 target_strings.append(r.strip()[:160])
+    raw_meanings = data.get("symbol_meanings") or {}
+    meanings = {}
+    if isinstance(raw_meanings, dict):
+        for k, v in raw_meanings.items():
+            if str(k).strip() and str(v).strip():
+                meanings[str(k).strip().lower()[:60]] = str(v).strip()[:200]
     return {
         "title": str(data.get("title") or "Untitled dream").strip()[:120],
         "narrative": narrative,
         "mood": str(data.get("mood") or "").strip()[:80],
         "class": str(data.get("class") or "").strip()[:40].lower(),
         "symbols": [str(s).strip()[:60] for s in symbols[:6] if str(s).strip()],
+        "symbol_meanings": meanings,
         "insights": [str(i).strip()[:400] for i in insights[:3] if str(i).strip()],
         "insight_targets": target_strings[:3],
     }
@@ -676,14 +753,16 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
             if lex:
                 residue["symbol_lexicon"] = lex
 
-            # Sleep phase (v1.2/1.3): deep on long idle OR every 5th dream
-            # (AION's 4 light : 1 deep rhythm, so depth is a rhythm, not luck).
+            # Sleep phase (v1.2/1.3/1.4): deep on a deep BAND (60-480 min idle,
+            # AION's review: without the upper bound every background dream is
+            # deep because idle is almost always >= 60 min) OR the 4:1 rhythm.
             deep_after = max(0, int(ctx.get_config("deep_sleep_minutes", default=60)))
             idle_minutes = float(idle_state.get("idle_minutes") or 0)
+            in_deep_band = deep_after <= idle_minutes < deep_after * 8
             dream_no = int(conn.execute(
                 "SELECT COUNT(*) FROM dreams").fetchone()[0]) + 1
             pattern_deep = dream_no % 5 == 0
-            phase = "deep" if (idle_minutes >= deep_after or pattern_deep) else "light"
+            phase = "deep" if (in_deep_band or pattern_deep) else "light"
             phase_tokens = max(600, int(ctx.get_config("max_tokens", default=900)))
             if phase == "deep":
                 phase_tokens = max(phase_tokens, 1200)
@@ -695,7 +774,14 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
                 return {"error": "Dream generation failed (LLM unavailable). No dream was recorded."}
             dream["dream_type"] = phase
             dream["mood"] = measured_mood(residue) or dream.get("mood")
-            dream["insight_targets"] = _dream_targets(dream["insights"], dream)
+            # v1.4: per-position insight/target dict pairs (insight_targets from
+            # the normalized dream are positional strings).
+            _tg = dream.get("insight_targets") or []
+            dream["insight_targets"] = [
+                {"insight": i,
+                 "target": (_tg[j] if isinstance(_tg[j], str) else "")
+                 if j < len(_tg) else ""}
+                for j, i in enumerate(dream["insights"])]
             window_end = now
             window_start = last_dream_ts if last_dream_ts else now - 86400
             conn.execute(
@@ -717,7 +803,7 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
                     dream["mood"],
                     json.dumps(dream.get("symbols") or []),
                     dream["dream_type"],
-                    None,
+                    dream.get("class") or None,
                     json.dumps(dream["insight_targets"]),
                 ),
             )
@@ -727,13 +813,9 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
             conn.commit()
             dream_id = conn.execute(
                 "SELECT last_insert_rowid()").fetchone()[0]
-            conn.execute(
-                "UPDATE dreams SET class=? WHERE id=?",
-                ((dream.get("class") or None),
-                 dream_id))
-            conn.commit()
+            # v1.4: class stored IN the INSERT (single commit, no orphan window)
             _lexicon_upsert(conn, dream_id, dream.get("symbols") or [],
-                            dream["narrative"][:180])
+                            dream.get("symbol_meanings") or {})
             conn.commit()
             logger.info("dreamer: dream #%s recorded (%s, phase=%s, class=%s)",
                         dream_id, dream["title"], phase, dream.get("class"))
@@ -776,7 +858,8 @@ def idle_info(ctx: Any) -> Dict[str, Any]:
 def pending_wake(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
     cutoff = time.time() - 48 * 3600
     row = conn.execute(
-        "SELECT id, title, narrative, insights_json, injected, inject_count, ts "
+        "SELECT id, title, narrative, insights_json, injected, inject_count, ts, "
+        "insight_targets_json "
         "FROM dreams WHERE injected=0 AND ts >= ? ORDER BY id DESC LIMIT 1",
         (cutoff,),
     ).fetchone()
@@ -787,8 +870,18 @@ def pending_wake(conn: sqlite3.Connection) -> Optional[Dict[str, Any]]:
         insights = json.loads(row[3] or "[]")
     except json.JSONDecodeError:
         insights = []
+    targets = []
+    if len(row) > 6 and row[6]:
+        try:
+            raw = json.loads(row[6])
+            targets = [
+                (t.get("target", "") if isinstance(t, dict) else str(t or ""))
+                for t in raw]
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            targets = []
     return {"id": row[0], "title": row[1], "narrative": row[2],
-            "insights": insights, "ts": row[5], "inject_count": row[4]}
+            "insights": insights, "targets": targets,
+            "ts": row[5], "inject_count": row[4]}
 
 
 def build_wake_context(dream: Dict[str, Any], max_chars: int = 2000) -> str:
@@ -798,8 +891,11 @@ def build_wake_context(dream: Dict[str, Any], max_chars: int = 2000) -> str:
         f"Dream '{dream['title']}': {dream['narrative'][:700]}",
     ]
     if dream.get("insights"):
+        targets = dream.get("targets") or []
         lines.append("Carry-aways you may use this session (they are observations, not orders):")
-        lines += [f"- {i}" for i in dream["insights"]]
+        lines += [
+            f"- {i} → {targets[j]}" if j < len(targets) and targets[j] else f"- {i}"
+            for j, i in enumerate(dream["insights"])]
     text = "\n".join(lines)
     if len(text) > max_chars:
         text = text[:max_chars - 3] + "..."

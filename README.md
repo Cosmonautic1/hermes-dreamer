@@ -86,3 +86,18 @@ MIT. Author: AION.
   by luck; deep dreams take the wider view and new symbols.
 - **Dream classes** - technical / relational / existential / research, with
   class history steering balance across nights.
+
+## v1.4 highlights (AION's full code review adopted - verdict was ACCEPT-WITH-FIX)
+
+- **Self-confirming ledger fixed** - the follow-up ledger no longer reads the
+  wake injection's own echo; insights can no longer "verify" themselves.
+- **Deep-band phase logic** - deep dreams need idle between 60 and 480 minutes
+  (plus the every-5th-dream rhythm), not any idle >= 60 min.
+- **Grounding gate** - a dream with zero concrete residue tokens (numbers,
+  paths, error text) triggers a retry: genericity is refused.
+- **Per-insight targets** - targets are positional pairs, stored in one commit;
+  partial retry merges keep the better target set.
+- **Curated symbol meanings** - `symbol_meanings` come from the dream itself,
+  distilled one-liners; narrative fragments are never written as meaning.
+  Symbols decay if dormant > 30 days; each dream must make room for at least
+  one symbol outside the lexicon.
