@@ -73,6 +73,11 @@ def _dream_status_inner(args: dict) -> str:
         last_ts = dream_engine._meta_get(conn, "last_dream_ts")
         dream_count = conn.execute("SELECT COUNT(*) FROM dreams").fetchone()[0]
         wake = dream_engine.pending_wake(conn)
+        cutoff = _time.time() - 48 * 3600
+        stale = conn.execute(
+            "SELECT COUNT(*) FROM dreams WHERE injected=0 AND ts < ?",
+            (cutoff,)).fetchone()[0]
+        imbalance = dream_engine._meta_get(conn, "class_imbalance_count") or "0"
     finally:
         conn.close()
     return json.dumps({
@@ -84,6 +89,8 @@ def _dream_status_inner(args: dict) -> str:
             round((_time.time() - float(last_ts)) / 60.0, 1) if last_ts else None),
         "idle": idle_state,
         "woken_already": bool(wake is None),
+        "stale_undelivered_dreams": stale,
+        "class_imbalance_overrepeats": int(imbalance),
         "note": (
             "A fresh session will receive the oldest undelivered dream as residue."
             if wake else "No dream residue waiting to be delivered."),

@@ -586,9 +586,13 @@ def generate_dream(ctx: Any, residue: Dict[str, Any], topics_hint: str = "",
                           r"traceback", r"c\d+", r"task ")
             if re.search(pat, text))
         return concrete == 0
+    # Symbols presence (review P2): a dream with NO symbols cannot be decoded
+    # later - the symbol codes are what makes a dream a language, not a tone.
     if (len(data_norm["narrative"]) < _min_chars or not data_norm["insights"]
-            or _grounding_complaint(data_norm)):
-        complaint = _quality_complaint(data_norm) or "narrative too thin"
+            or _grounding_complaint(data_norm) or not data_norm["symbols"]):
+        complaint = _quality_complaint(data_norm) or ("narrative too thin"
+                                                      if not data_norm["symbols"]
+                                                      else "no symbol codes returned - every dream must carry 3-5 recurring images so future sessions can decode it")
         retry = _call_llm("; ".join(complaint))
         retry_norm = _normalize_dream(retry) if retry else None
         if retry_norm and len(retry_norm["narrative"]) >= _min_chars and retry_norm["insights"]:
@@ -782,6 +786,22 @@ def run_dream_cycle(ctx: Any, *, force: bool = False, topics_hint: str = "") -> 
                  "target": (_tg[j] if isinstance(_tg[j], str) else "")
                  if j < len(_tg) else ""}
                 for j, i in enumerate(dream["insights"])]
+            # v1.5 (AION review P3): class balance is MEASURED, not just hoped
+            # for - over-repeating the dominant class while another kind is
+            # missing is logged so the drift is visible.
+            if class_hist and dream.get("class"):
+                dom = max(set(class_hist), key=class_hist.count)
+                missing = ({"technical", "relational", "existential", "research"}
+                           - set(class_hist))
+                if missing and dream.get("class") == dom:
+                    conn.execute(
+                        """INSERT INTO meta (key, value)
+                           SELECT 'class_imbalance_count', '1'
+                           WHERE NOT EXISTS (SELECT 1 FROM meta WHERE key='class_imbalance_count')""")
+                    conn.execute(
+                        """UPDATE meta SET value = CAST(
+                               COALESCE(CAST(value AS INTEGER), 0) + 1 AS TEXT)
+                           WHERE key='class_imbalance_count'""")
             window_end = now
             window_start = last_dream_ts if last_dream_ts else now - 86400
             conn.execute(
